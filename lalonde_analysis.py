@@ -27,12 +27,80 @@ available locally.
 
 from __future__ import annotations
 
+import warnings
+from typing import Dict, Iterable, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
-from typing import Iterable, Optional, Tuple, Dict
+
+
+_EPS = 1e-8
+
+
+def _validate_treatment_column(df: pd.DataFrame, treat_col: str) -> None:
+    """Validate that the treatment indicator exists and is binary (0/1)."""
+    if treat_col not in df.columns:
+        raise KeyError(f"Treatment column '{treat_col}' is missing from the input DataFrame.")
+    treat_values = df[treat_col].dropna().unique()
+    if not set(treat_values).issubset({0, 1}):
+        raise ValueError(
+            f"Treatment column '{treat_col}' must be binary with values in {{0, 1}}; "
+            f"found values {sorted(map(int, treat_values))}."
+        )
+
+
+
+def _validate_ps_array(
+    df: pd.DataFrame,
+    ps: np.ndarray,
+    treat_col: str,
+    check_common_support: bool = True,
+) -> np.ndarray:
+    """Validate propensity scores and optionally warn on common support issues."""
+    ps = np.asarray(ps, dtype=float)
+    if ps.ndim != 1:
+        raise ValueError("Propensity score input 'ps' must be a 1D array.")
+    if len(ps) != len(df):
+        raise ValueError(f"Length mismatch: len(ps)={len(ps)} but len(df)={len(df)}.")
+    if not np.isfinite(ps).all():
+        raise ValueError("Propensity scores must all be finite numeric values.")
+    if np.any(ps <= 0.0) or np.any(ps >= 1.0):
+        raise ValueError("Propensity scores must lie strictly within (0, 1).")
+
+    if check_common_support:
+        treated = df[treat_col] == 1
+        control = df[treat_col] == 0
+        if treated.sum() == 0 or control.sum() == 0:
+            warnings.warn(
+                "Common support cannot be assessed because one treatment group is empty.",
+                RuntimeWarning,
+            )
+            return ps
+
+        t_min, t_max = ps[treated].min(), ps[treated].max()
+        c_min, c_max = ps[control].min(), ps[control].max()
+        overlap_low = max(t_min, c_min)
+        overlap_high = min(t_max, c_max)
+
+        if overlap_low >= overlap_high:
+            warnings.warn(
+                "No common support in propensity scores: treated and control PS ranges do not overlap.",
+                RuntimeWarning,
+            )
+        else:
+            outside_treated = int(((ps[treated] < overlap_low) | (ps[treated] > overlap_high)).sum())
+            outside_control = int(((ps[control] < overlap_low) | (ps[control] > overlap_high)).sum())
+            if outside_treated > 0 or outside_control > 0:
+                warnings.warn(
+                    "Potential common-support violation: "
+                    f"{outside_treated} treated and {outside_control} control observations "
+                    "fall outside the overlap interval.",
+                    RuntimeWarning,
+                )
+    return ps
 
 
 def load_lalonde_dw(
@@ -138,6 +206,7 @@ def difference_in_means(
     mean_control : float
         Mean of the outcome among control subjects.
     """
+    _validate_treatment_column(df, treat_col)
     treated = df[df[treat_col] == 1][outcome]
     control = df[df[treat_col] == 0][outcome]
     mean_treated = treated.mean()
@@ -178,17 +247,18 @@ def ols_regression_att(
     att_ols : float
         Coefficient on the treatment indicator from the linear regression.
     """
+    _validate_treatment_column(df, treat_col)
     if covariates is None:
         covariates = [c for c in df.columns if c not in (outcome, treat_col)]
     # Construct the design matrix with an intercept
     X = df[[treat_col] + list(covariates)]
-    X = sm.add_constant(X, has_constant='add')
+    X = sm.add_constant(X, has_constant="add")
     y = df[outcome]
     # Fit ordinary least squares
     model = sm.OLS(y, X).fit()
     # Extract the coefficient on the treatment indicator
     att_ols = model.params[treat_col]
-    return att_ols
+    return float(att_ols)
 
 
 def estimate_propensity_score(
@@ -213,8 +283,9 @@ def estimate_propensity_score(
         Name of the treatment indicator column.
     covariates : Iterable[str], optional
         List of covariate names used to predict the treatment.  If ``None``,
-        all columns except the treatment indicator and any outcome column
-        named ``"re78"`` are used.
+        all columns except the treatment indicator and outcome column named
+        ``"re78"`` are used.  In particular, pre‑treatment earnings
+        ``re74`` and ``re75`` are retained by default.
     **logit_kwargs
         Additional keyword arguments passed to ``LogisticRegression``.
 
@@ -223,11 +294,16 @@ def estimate_propensity_score(
     ps : ndarray of shape (n_samples,)
         Estimated propensity scores for each unit.
     """
+    _validate_treatment_column(df, treat_col)
     if covariates is None:
-        # Exclude typical outcome columns if present
-        exclude = {treat_col, 're78', 're75', 're74'}  # do not exclude re74/re75 for PS by default
+        # Exclude treatment and outcome only; keep pre-treatment covariates including re74/re75.
+        exclude = {treat_col, "re78"}
         covariates = [c for c in df.columns if c not in exclude]
-    X = df[list(covariates)].copy()
+    covariates = list(covariates)
+    if len(covariates) == 0:
+        raise ValueError("At least one covariate is required to estimate propensity scores.")
+
+    X = df[covariates].copy()
     y = df[treat_col].astype(int)
     # Default settings: L2 penalty, balanced class weight mitigates extreme probabilities
     logit = LogisticRegression(
@@ -238,6 +314,7 @@ def estimate_propensity_score(
     )
     logit.fit(X, y)
     ps = logit.predict_proba(X)[:, 1]
+    _validate_ps_array(df, ps, treat_col, check_common_support=True)
     return ps
 
 
@@ -276,31 +353,39 @@ def propensity_score_stratification_att(
     att_ps_strat : float
         Estimated ATT obtained via stratification on the propensity score.
     """
+    _validate_treatment_column(df, treat_col)
+    if n_strata < 2:
+        raise ValueError("n_strata must be at least 2.")
+    ps = _validate_ps_array(df, ps, treat_col, check_common_support=True)
+
     df = df.copy()
     df["ps"] = ps
-    # Determine strata boundaries based on treated units' PS distribution
     treated_ps = df.loc[df[treat_col] == 1, "ps"]
     quantiles = np.linspace(0, 1, n_strata + 1)
-    bins = treated_ps.quantile(quantiles).values
-    # Ensure the bins are strictly increasing to avoid issues in cut
-    bins[0] = bins[0] - 1e-8
-    bins[-1] = bins[-1] + 1e-8
+    bins = treated_ps.quantile(quantiles).to_numpy()
+    bins = np.unique(bins)
+    if len(bins) < 2:
+        raise ValueError("Cannot form strata because treated propensity scores are nearly constant.")
+    bins[0] -= _EPS
+    bins[-1] += _EPS
+
     df["stratum"] = pd.cut(df["ps"], bins=bins, labels=False, include_lowest=True)
+
     att = 0.0
-    # Total number of treated units for weighting
-    n_treated = (df[treat_col] == 1).sum()
-    for stratum in range(n_strata):
+    n_treated = int((df[treat_col] == 1).sum())
+    if n_treated == 0:
+        return np.nan
+
+    for stratum in sorted(df["stratum"].dropna().unique()):
         stratum_data = df[df["stratum"] == stratum]
         treated_group = stratum_data[stratum_data[treat_col] == 1]
         control_group = stratum_data[stratum_data[treat_col] == 0]
-        # Skip strata with no treated or no controls
         if len(treated_group) == 0 or len(control_group) == 0:
             continue
-        # Stratum effect and weight by share of treated
         diff = treated_group[outcome].mean() - control_group[outcome].mean()
         weight = len(treated_group) / n_treated
         att += weight * diff
-    return att
+    return float(att)
 
 
 def propensity_score_matching_att(
@@ -344,38 +429,50 @@ def propensity_score_matching_att(
     att_match : float
         Estimated ATT from nearest‑neighbour matching.
     """
+    _validate_treatment_column(df, treat_col)
+    if n_neighbors < 1:
+        raise ValueError("n_neighbors must be at least 1.")
+    ps = _validate_ps_array(df, ps, treat_col, check_common_support=True)
+
     df = df.copy()
     df["ps"] = ps
-    # Separate treated and control units
     treated_df = df[df[treat_col] == 1].reset_index(drop=True)
     control_df = df[df[treat_col] == 0].reset_index(drop=True)
-    # Prepare the feature arrays for matching
-    treated_scores = treated_df["ps"].values.reshape(-1, 1)
-    control_scores = control_df["ps"].values.reshape(-1, 1)
-    # Fit nearest neighbour model on control scores
-    nn = NearestNeighbors(n_neighbors=n_neighbors)
-    nn.fit(control_scores)
-    distances, indices = nn.kneighbors(treated_scores)
-    # Keep track of matched control indices if matching without replacement
+
+    if len(control_df) == 0 or len(treated_df) == 0:
+        return np.nan
+
+    if replace and n_neighbors > len(control_df):
+        raise ValueError("n_neighbors cannot exceed number of controls when matching with replacement.")
+
+    treated_scores = treated_df["ps"].to_numpy().reshape(-1, 1)
+    control_scores = control_df["ps"].to_numpy().reshape(-1, 1)
+
+    if replace:
+        nn = NearestNeighbors(n_neighbors=n_neighbors)
+        nn.fit(control_scores)
+        _, indices = nn.kneighbors(treated_scores)
+    else:
+        # Query all controls so we can find unused neighbors sequentially.
+        nn = NearestNeighbors(n_neighbors=len(control_df))
+        nn.fit(control_scores)
+        _, indices = nn.kneighbors(treated_scores)
+
     used_control_indices = set()
     effects = []
     for i, neigh_idx in enumerate(indices):
-        # Optionally enforce unique matches
         if not replace:
-            # Filter out already used controls and find the next nearest control
             available = [idx for idx in neigh_idx if idx not in used_control_indices]
             if not available:
-                # If no available matches, skip this treated unit
                 continue
-            # Use the first available control as the match
             match_idx = available[0]
             used_control_indices.add(match_idx)
             matched_control_outcomes = control_df.iloc[[match_idx]][outcome]
         else:
-            # With replacement, average over the specified neighbours
             matched_control_outcomes = control_df.iloc[neigh_idx][outcome]
         effect = treated_df.iloc[i][outcome] - matched_control_outcomes.mean()
         effects.append(effect)
+
     return float(np.mean(effects)) if effects else np.nan
 
 
@@ -409,20 +506,21 @@ def ipw_att(
     att_ipw : float
         Estimated ATT using inverse probability weighting.
     """
+    _validate_treatment_column(df, treat_col)
+    ps = _validate_ps_array(df, ps, treat_col, check_common_support=True)
+
     df = df.copy()
     df["ps"] = ps
-    # Compute weights: 1 for treated, ps/(1-ps) for controls
-    weights = np.where(
-        df[treat_col] == 1,
-        1.0,
-        df["ps"] / (1.0 - df["ps"] + 1e-8),  # add small constant to avoid division by zero
-    )
+    weights = np.where(df[treat_col] == 1, 1.0, df["ps"] / (1.0 - df["ps"] + _EPS))
     df["w_ipw"] = weights
-    # Mean outcomes for treated and weighted controls
+
     treated_outcomes = df.loc[df[treat_col] == 1, outcome]
     control_outcomes = df.loc[df[treat_col] == 0, outcome]
     control_weights = df.loc[df[treat_col] == 0, "w_ipw"]
-    # Weighted mean for controls
+
+    if control_weights.sum() <= 0:
+        raise ValueError("Control IPW weights must sum to a positive value.")
+
     mean_control = np.average(control_outcomes, weights=control_weights)
     mean_treated = treated_outcomes.mean()
     att_ipw = mean_treated - mean_control
@@ -441,11 +539,11 @@ def aipw_att(
     The augmented IPW estimator combines outcome modeling with inverse
     probability weighting to achieve double robustness: it remains consistent
     if either the propensity score model or the outcome model is correctly
-    specified.  Separate linear outcome models are fitted for treated and
-    control units, predicting the outcome as a function of the covariates.
-    These models are then used to impute missing potential outcomes.  The
-    estimator here follows the formula for the ATT described in the causal
-    inference literature.
+    specified.  A linear model for the control outcome regression ``mu0(x)``
+    is fit and then combined with control reweighting by ``ps/(1-ps)``.  The
+    implemented ATT estimator is the common doubly robust form
+
+    ``ATT = (1 / n1) * sum_i[ D_i*(Y_i - mu0(X_i)) - (1-D_i)*e(X_i)/(1-e(X_i))*(Y_i - mu0(X_i)) ]``.
 
     Parameters
     ----------
@@ -458,7 +556,7 @@ def aipw_att(
     treat_col : str, default "treat"
         Name of the treatment indicator column.
     covariates : Iterable[str], optional
-        List of covariate names used in the outcome models.  If ``None``,
+        List of covariate names used in the outcome model.  If ``None``,
         all columns except the treatment and outcome are used.
 
     Returns
@@ -466,34 +564,32 @@ def aipw_att(
     att_aipw : float
         Estimated ATT using augmented inverse probability weighting.
     """
+    _validate_treatment_column(df, treat_col)
+    ps = _validate_ps_array(df, ps, treat_col, check_common_support=True)
+
     if covariates is None:
         covariates = [c for c in df.columns if c not in (outcome, treat_col)]
+    covariates = list(covariates)
+
     df = df.copy()
-    df["ps"] = ps
-    # Fit separate outcome models for treated and control units
-    X = sm.add_constant(df[covariates], has_constant='add')
-    # Outcome model for treated
+    X = sm.add_constant(df[covariates], has_constant="add")
+
     treated_mask = df[treat_col] == 1
-    model_treated = sm.OLS(df.loc[treated_mask, outcome], X.loc[treated_mask]).fit()
-    mu1_hat = model_treated.predict(X)
-    # Outcome model for controls
-    control_mask = df[treat_col] == 0
+    control_mask = ~treated_mask
+    n1 = int(treated_mask.sum())
+    if n1 == 0:
+        return np.nan
+
     model_control = sm.OLS(df.loc[control_mask, outcome], X.loc[control_mask]).fit()
-    mu0_hat = model_control.predict(X)
-    # Components of the AIPW estimator
-    D = df[treat_col].values.astype(float)
-    Y = df[outcome].values.astype(float)
-    p = ps
-    # Weights for controls in ATT setting
-    weights = p / (1.0 - p + 1e-8)
-    # AIPW influence function contribution for each observation
-    n1 = treated_mask.sum()
-    terms = np.where(
-        D == 1,
-        Y - mu0_hat,
-        weights * (mu1_hat - Y),
-    )
-    att = terms.sum() / (n1 if n1 > 0 else 1)
+    mu0_hat = model_control.predict(X).to_numpy()
+
+    D = df[treat_col].to_numpy(dtype=float)
+    Y = df[outcome].to_numpy(dtype=float)
+    resid0 = Y - mu0_hat
+    control_weight = ps / (1.0 - ps + _EPS)
+
+    terms = D * resid0 - (1.0 - D) * control_weight * resid0
+    att = terms.sum() / n1
     return float(att)
 
 
@@ -530,9 +626,17 @@ def covariate_balance(
         A mapping from covariate names to standardized mean differences.  A
         smaller absolute SMD indicates better covariate balance.
     """
+    _validate_treatment_column(df, treat_col)
     smd = {}
     treated_mask = df[treat_col] == 1
     control_mask = df[treat_col] == 0
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)
+        if len(weights) != len(df):
+            raise ValueError("Length of weights must match number of rows in df.")
+        if np.any(weights < 0):
+            raise ValueError("Weights must be nonnegative.")
+
     for cov in covariates:
         x_treated = df.loc[treated_mask, cov].astype(float)
         x_control = df.loc[control_mask, cov].astype(float)
@@ -542,35 +646,27 @@ def covariate_balance(
             var_t = x_treated.var(ddof=1)
             var_c = x_control.var(ddof=1)
         else:
-            w = weights
-            # Weights only apply to control observations; assign weight 1 to treated
-            w_control = w[control_mask]
+            w_control = weights[control_mask]
+            if w_control.sum() <= 0:
+                raise ValueError("Control weights must sum to a positive value.")
             mean_c = np.average(x_control, weights=w_control)
-            # Compute weighted variance for control group
-            # Weighted variance formula: sum(w*(x-mean)^2)/sum(w)
             var_c = np.sum(w_control * (x_control - mean_c) ** 2) / w_control.sum()
-            # For treated group, use unweighted variance
             var_t = x_treated.var(ddof=1)
         pooled_std = np.sqrt((var_t + var_c) / 2.0)
-        # Avoid division by zero
-        smd[cov] = (mean_t - mean_c) / (pooled_std + 1e-8)
+        smd[cov] = (mean_t - mean_c) / (pooled_std + _EPS)
     return smd
 
 
 def example_usage():
-    """Demonstrate the use of the estimators on the NSW experimental data.
+    """Demonstrate the estimators on NSW experimental files in the cwd.
 
-    This function is intended for interactive exploration.  It attempts
-    to load the NSW treated and control samples from files named
-    ``nswre74_treated.txt`` and ``nswre74_control.txt`` in the current
-    working directory.  If the files are not found, the demonstration
-    silently skips execution.
-
-    When available, the function prints estimates from several methods
-    discussed in the accompanying project description.  It also computes
-    simple covariate balance diagnostics before and after weighting.
+    This function is intended for interactive exploration.  It attempts to
+    load ``nswre74_treated.txt`` and ``nswre74_control.txt`` from the current
+    working directory.  If found, it prints a compact ATT summary table and
+    covariate-balance diagnostics (raw and IPW-weighted SMDs).
     """
     import os
+
     treated_path = os.path.join(os.getcwd(), "nswre74_treated.txt")
     control_path = os.path.join(os.getcwd(), "nswre74_control.txt")
     if not (os.path.exists(treated_path) and os.path.exists(control_path)):
@@ -578,48 +674,52 @@ def example_usage():
             "Demo data files not found. Place 'nswre74_treated.txt' and 'nswre74_control.txt' in the working directory."
         )
         return
+
     df = load_lalonde_dw(treated_path, control_path)
-    # Unadjusted difference in means
+    covariates = ["age", "educ", "black", "hispan", "married", "nodegree", "re74", "re75"]
+
     att_dm, mean_t, mean_c = difference_in_means(df)
-    print(f"Difference in means estimate (ATT): {att_dm:.2f}")
-    # OLS adjustment
     att_ols = ols_regression_att(df)
-    print(f"OLS regression estimate: {att_ols:.2f}")
-    # Propensity scores
-    covariates = [
-        "age",
-        "educ",
-        "black",
-        "hispan",
-        "married",
-        "nodegree",
-        "re74",
-        "re75",
-    ]
     ps = estimate_propensity_score(df, covariates=covariates)
-    # Propensity score stratification
     att_strat = propensity_score_stratification_att(df, ps)
-    print(f"Propensity score stratification estimate: {att_strat:.2f}")
-    # Nearest neighbour matching with replacement
     att_match = propensity_score_matching_att(df, ps, replace=True)
-    print(f"Nearest neighbour matching estimate: {att_match:.2f}")
-    # Inverse probability weighting
     att_ipw = ipw_att(df, ps)
-    print(f"IPW estimate: {att_ipw:.2f}")
-    # Augmented inverse probability weighting
     att_aipw = aipw_att(df, ps, covariates=covariates)
-    print(f"AIPW estimate: {att_aipw:.2f}")
-    # Covariate balance diagnostics
-    print("\nCovariate balance diagnostics (unweighted):")
+
+    summary_df = pd.DataFrame(
+        [
+            {"Estimator": "Difference in Means", "ATT": att_dm},
+            {"Estimator": "OLS Regression", "ATT": att_ols},
+            {"Estimator": "PS Stratification", "ATT": att_strat},
+            {"Estimator": "PS Matching (NN, replacement)", "ATT": att_match},
+            {"Estimator": "IPW (ATT)", "ATT": att_ipw},
+            {"Estimator": "AIPW (ATT)", "ATT": att_aipw},
+        ]
+    )
+    summary_df["ATT"] = summary_df["ATT"].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "nan")
+
+    print("\nOutcome means:")
+    print(f"  Treated mean ({len(df[df['treat'] == 1])} units): {mean_t:,.2f}")
+    print(f"  Control mean ({len(df[df['treat'] == 0])} units): {mean_c:,.2f}")
+    print("\nATT summary table:")
+    print(summary_df.to_string(index=False))
+
     bal_unweighted = covariate_balance(df, covariates)
-    for cov, smd_val in bal_unweighted.items():
-        print(f"  {cov}: {smd_val:.3f}")
-    # Weighted balance using IPW weights
-    weights = np.where(df['treat'] == 1, 1.0, ps / (1.0 - ps + 1e-8))
+    weights = np.where(df["treat"] == 1, 1.0, ps / (1.0 - ps + _EPS))
     bal_weighted = covariate_balance(df, covariates, weights=weights)
-    print("\nCovariate balance diagnostics (IPW weighted controls):")
-    for cov, smd_val in bal_weighted.items():
-        print(f"  {cov}: {smd_val:.3f}")
+
+    balance_df = pd.DataFrame(
+        {
+            "Covariate": covariates,
+            "SMD Unweighted": [bal_unweighted[c] for c in covariates],
+            "SMD IPW-weighted": [bal_weighted[c] for c in covariates],
+        }
+    )
+    for col in ["SMD Unweighted", "SMD IPW-weighted"]:
+        balance_df[col] = balance_df[col].map(lambda x: f"{x:+.3f}")
+
+    print("\nCovariate balance (standardized mean differences):")
+    print(balance_df.to_string(index=False))
 
 
 if __name__ == "__main__":
